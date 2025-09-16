@@ -6,6 +6,7 @@ import (
 )
 
 // RingBuf is a thread-safe, fixed-size ring buffer that implements io.Writer.
+// It preserves the last N bytes of data written to it.
 type RingBuf struct {
 	buf            []byte
 	pos            int  // Current writing position
@@ -24,62 +25,94 @@ func NewRingBuf(bufSize int) *RingBuf {
 	}
 }
 
-// Write implements the io.Writer interface. It saves the last len(buf) bytes
-// of data from p and forwards the write to an attached writer, if any.
+// Write saves data to the buffer, overwriting the oldest data if the buffer is full.
+// It is optimized to use `copy` instead of a byte-by-byte loop.
 func (rb *RingBuf) Write(p []byte) (n int, err error) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
-	// If an io.Writer is attached, forward the write to it immediately.
 	if rb.attachedWriter != nil {
-		// We ignore the result of this write as the primary function
-		// is to fill the internal buffer.
 		rb.attachedWriter.Write(p)
 	}
 
-	// Efficiently copy the incoming data into the ring buffer.
-	// This handles cases where p is larger than the buffer itself.
-	for _, b := range p {
-		rb.buf[rb.pos] = b
-		rb.pos++
-		if rb.pos >= len(rb.buf) {
+	originalLen := len(p)
+
+	// If the input is larger than the buffer, we only care about the last part.
+	if len(p) > len(rb.buf) {
+		p = p[len(p)-len(rb.buf):]
+	}
+
+	bytesToWrite := len(p)
+	spaceToEnd := len(rb.buf) - rb.pos
+
+	if bytesToWrite > spaceToEnd {
+		// The write wraps around the end of the buffer.
+		copy(rb.buf[rb.pos:], p[:spaceToEnd])
+		copy(rb.buf[0:], p[spaceToEnd:])
+		rb.pos = bytesToWrite - spaceToEnd
+		rb.full = true
+	} else {
+		// The write fits without wrapping.
+		copy(rb.buf[rb.pos:], p)
+		rb.pos += bytesToWrite
+		if rb.pos == len(rb.buf) {
+			// Exactly filled the buffer to the end.
 			rb.pos = 0
 			rb.full = true
 		}
 	}
 
-	return len(p), nil
+	// Per the io.Writer contract, return the length of the original slice.
+	return originalLen, nil
 }
 
-// Attach connects an io.Writer. It first dumps the entire current buffer
-// contents to the writer and then forwards all subsequent writes to it.
-func (rb *RingBuf) Attach(writer io.Writer) {
+// Len returns the number of bytes currently stored in the buffer.
+func (rb *RingBuf) Len() int {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	if rb.full {
+		return len(rb.buf)
+	}
+	return rb.pos
+}
+
+// Bytes returns the contents of the buffer as a single, ordered slice of bytes.
+func (rb *RingBuf) Bytes() []byte {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	return rb.bytes()
+}
+
+// bytes is the internal, unlocked implementation for retrieving buffer contents.
+func (rb *RingBuf) bytes() []byte {
+	if !rb.full {
+		return rb.buf[:rb.pos]
+	}
+	// When full, "unroll" the buffer by combining the two segments.
+	return append(rb.buf[rb.pos:], rb.buf[:rb.pos]...)
+}
+
+// DumpAttach sets an attached writer and dumps the current buffer contents to it.
+func (rb *RingBuf) DumpAttach(writer io.Writer) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
-	// Dump the current contents of the buffer to the new writer.
+	// Call the internal, unlocked bytes() method to avoid deadlock.
 	writer.Write(rb.bytes())
-
 	rb.attachedWriter = writer
 }
 
-// Detach disconnects the io.Writer, stopping any future writes from being forwarded.
+// Detach disconnects the io.Writer.
 func (rb *RingBuf) Detach() {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
-
 	rb.attachedWriter = nil
 }
 
-// bytes returns the contents of the buffer as a single, ordered slice of bytes.
-// This is an internal helper that must be called with the mutex held.
-func (rb *RingBuf) bytes() []byte {
-	if !rb.full {
-		// If the buffer hasn't wrapped yet, the data is just the initial part.
-		return rb.buf[:rb.pos]
-	}
-	// If the buffer has wrapped, the data is from the current position to the end,
-	// followed by the data from the beginning to the current position.
-	// append is an efficient way to concatenate these two slices.
-	return append(rb.buf[rb.pos:], rb.buf[:rb.pos]...)
+// Reset clears the buffer.
+func (rb *RingBuf) Reset() {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	rb.pos = 0
+	rb.full = false
 }

@@ -1,18 +1,13 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"io"
 	"log"
 	"net"
-	"os"
-	"os/exec"
 	"strconv"
 
 	"github.com/gliderlabs/ssh"
 	gossh "golang.org/x/crypto/ssh"
-	"golang.org/x/term"
 )
 
 type LoginChange struct {
@@ -76,83 +71,29 @@ func MakeRestarterTCPHandler(loginChan chan LoginChange) ssh.ChannelHandler {
 	}
 }
 
-func startCmd(cmdline []string) *exec.Cmd {
-	cmd := exec.Command(cmdline[0], cmdline[1:]...)
-	log.Println("started command:", cmd.String())
-	go cmd.Run()
-	return cmd
-}
-
-// manages attaching/detactching from a process
-// if detatched, the goroutine listens for "term" and attaches
-// if attached, the user's stdin is connected to fwdStdin until CTRL+D is entered
-func stdinManager(attachChan chan bool, fwdStdin io.WriteCloser) {
-	var attached = false
-	var termState *term.State = nil
-	buf := make([]byte, 1024)
-	for {
-		if !attached {
-			scanner := bufio.NewScanner(os.Stdin)
-			// keep scanning until we see "term"
-			for scanner.Scan() {
-				if scanner.Text() == "term" {
-					log.Println("attaching terminal, CTRL+D to disconnect")
-					ts, err := term.MakeRaw(int(os.Stdin.Fd()))
-					termState = ts
-					if err != nil {
-						log.Println("failed to make terminal raw")
-						continue
-					}
-					attached = true
-					attachChan <- attached
-					break
-				}
-			}
-		} else {
-			for {
-				n, err := os.Stdin.Read(buf)
-				idx := bytes.IndexByte(buf[:n], 4) // 4 corresponds to EOD
-				shouldDetach := idx >= 0
-				lastInput := n
-				if shouldDetach {
-					lastInput = idx
-				}
-				if err == nil {
-					fwdStdin.Write(buf[:lastInput])
-				}
-				if err != nil || shouldDetach {
-					term.Restore(int(os.Stdin.Fd()), termState)
-					attached = false
-					attachChan <- attached
-					break
-				}
-			}
-		}
-	}
-}
-
 func Restarter(cmdline []string, loginChan chan LoginChange) {
-	waitChan := make(chan bool)
+	closeChan := make(chan bool)
 	sessions := map[string]bool{}
-	cmd := NewCmdWrapper(cmdline, waitChan)
-	cmd.Run()
+	stdinMgr, _ := StartStdinManager()
 	for {
+		cmd, _ := CmdWrapper(cmdline, closeChan, stdinMgr)
+
 		select {
 		case login := <-loginChan:
 			if login.newLogin {
 				sessions[login.loginId] = true
-				if !cmd.running {
-					cmd.Run()
+				if cmd == nil {
+					cmd, _ = CmdWrapper(cmdline, closeChan, stdinMgr)
 				}
 			} else {
 				delete(sessions, login.loginId)
 			}
 			log.Println("number of connections:", len(sessions))
-		case requestedKill := <-waitChan:
-			if !requestedKill {
+		case closeRequested := <-closeChan:
+			if !closeRequested {
 				log.Println("command closed extraneously!")
 			}
-			cmd.Run()
+			cmd = nil
 		}
 	}
 }

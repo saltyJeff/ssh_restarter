@@ -1,171 +1,166 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"io"
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
 	"time"
 
-	"github.com/creack/pty" // PTY: Import the library
+	"github.com/creack/pty"
 	"golang.org/x/term"
 )
 
-type cmdWrapper struct {
-	args []string
-	cmd  *exec.Cmd
-	// PTY: We only need one RingBuf since PTY merges stdout and stderr.
-	outputRb   *RingBuf
-	attachChan chan bool
-	running    bool
-	// PTY: We need a field to hold the master end of the PTY.
-	ptmx       *os.File
-	startTime  time.Time
-	waitChan   chan bool
-	killInited bool
-	termState  *term.State
+const (
+	ATTACHING = iota
+	DETACHING = iota
+	NOCHANGE  = iota
+)
+
+type StdinManagerMsg struct {
+	attach int
+	data   string
+}
+type StdinManager struct {
+	termState *term.State
+	attached  bool
+	rb        *RingBuf
+	inputChan chan StdinManagerMsg
 }
 
-func NewCmdWrapper(args []string, waitChan chan bool) *cmdWrapper {
-	return &cmdWrapper{
-		args: args,
-		// PTY: Initialize the single output buffer.
-		outputRb:   NewRingBuf(2 << 10), // Increased size for combined output
-		attachChan: make(chan bool),
-		running:    false,
-		waitChan:   waitChan,
-		killInited: false,
+func StartStdinManager() (*StdinManager, error) {
+	stdinMgr := &StdinManager{
+		inputChan: make(chan StdinManagerMsg),
+		attached:  false,
+		rb:        NewRingBuf(8),
 	}
-}
-
-func (cw *cmdWrapper) Run() {
-	log.Println("running:", cw.args)
-	if cw.running {
-		log.Println("cmd was already running, killing the cmd")
-		cw.Kill()
-	}
-
-	cw.cmd = exec.Command(cw.args[0], cw.args[1:]...)
-	ptmx, err := pty.Start(cw.cmd)
+	ts, err := term.GetState(stdinFd())
+	stdinMgr.termState = ts
 	if err != nil {
-		log.Fatalf("failed to start pty: %v", err)
+		return nil, err
 	}
-	// PTY: Ensure the PTY master file is closed when the function exits.
-	cw.ptmx = ptmx
-
-	// PTY: The process is now running. Launch the I/O managers.
-	go cw.stdinManager(cw.ptmx)  // Pass the PTY as the writer for stdin
-	go cw.outputManager(cw.ptmx) // Pass the PTY as the reader for output
-	cw.running = true
-	cw.startTime = time.Now()
-	cw.killInited = false
-	go func() {
-		defer ptmx.Close()
-		cw.cmd.Wait()
-		if cw.termState != nil {
-			term.Restore(int(os.Stdin.Fd()), cw.termState)
-			cw.termState = nil
-		}
-		log.Printf("Process uptime: %v", time.Since(cw.startTime))
-		cw.running = false
-		cw.waitChan <- cw.killInited
-	}()
+	go io.Copy(stdinMgr, os.Stdin)
+	return stdinMgr, nil
 }
 
-// PTY: The stdin manager now writes to the PTY file.
-func (cw *cmdWrapper) stdinManager(ptmx io.Writer) {
-	attached := false
-	buf := make([]byte, 128)
+var termSigil = regexp.MustCompile(`term\r?\n`)
 
-	for {
-		if !attached {
-			log.Println("In detached mode. Type 'term' and press Enter to attach.")
-			scanner := bufio.NewScanner(os.Stdin)
-			for scanner.Scan() {
-				if scanner.Text() == "term" {
-					log.Println("Attaching terminal, press CTRL+A to detach.")
-					ts, err := term.MakeRaw(int(os.Stdin.Fd()))
-					if err != nil {
-						log.Println("failed to make terminal raw:", err)
-						continue
-					}
-					cw.termState = ts
-					attached = true
-					cw.attachChan <- true
-					break
-				}
-			}
-		} else { // attached == true
-			for {
-				n, err := os.Stdin.Read(buf)
-				if err != nil { // This still handles stdin closing unexpectedly
-					term.Restore(int(os.Stdin.Fd()), cw.termState)
-					attached = false
-					cw.attachChan <- false
-					log.Println("Terminal detached due to stdin error.")
-					break
-				}
-
-				// Check for CTRL+A (ASCII value 1)
-				if idx := bytes.IndexByte(buf[:n], 1); idx != -1 {
-					// If there was any valid input before CTRL+A, send it.
-					if idx > 0 {
-						ptmx.Write(buf[:idx])
-					}
-
-					// Perform the detach sequence
-					term.Restore(int(os.Stdin.Fd()), cw.termState)
-					attached = false
-					cw.attachChan <- false // Signal to detach
-					log.Println("Terminal detached via CTRL+A.")
-					break // Exit the attached loop
-				}
-
-				// If no detach key was found, send the input to the process.
-				if n > 0 {
-					ptmx.Write(buf[:n])
-				}
-			}
+func (sm *StdinManager) Write(p []byte) (n int, err error) {
+	if !sm.attached {
+		n, err = sm.rb.Write(p)
+		if err != nil {
+			return n, err
 		}
-	}
-}
+		bufferBytes := sm.rb.Bytes()
+		loc := termSigil.FindIndex(bufferBytes)
+		if loc == nil {
+			return n, nil
+		}
+		log.Println("terminal attached. CTRL+A to detach")
 
-// PTY: This function now manages the single, merged output stream.
-func (cw *cmdWrapper) outputManager(ptmx io.Reader) {
-	// Start a goroutine to continuously pump data from the PTY into the ring buffer.
-	go io.Copy(cw.outputRb, ptmx)
-
-	// This loop listens for signals and manages the attach/detach state.
-	for {
-		shouldBeAttached := <-cw.attachChan
-
-		if shouldBeAttached {
-			// PTY: Attach the single output buffer to the user's terminal.
-			cw.outputRb.Attach(os.Stdout)
+		if ts, err := term.MakeRaw(stdinFd()); err == nil {
+			sm.termState = ts
 		} else {
-			cw.outputRb.Detach()
+			log.Printf("failed to set terminal to raw mode: %v", err)
+			return n, err
+		}
+		sm.attached = true
+		endOfSigil := loc[1]
+		dataAfterSigil := bufferBytes[endOfSigil:]
+
+		sm.inputChan <- StdinManagerMsg{
+			attach: ATTACHING,
+			data:   string(dataAfterSigil),
+		}
+		sm.rb.Reset()
+	} else {
+		// CTRL+A == 1
+		idx := bytes.IndexByte(p, 1)
+		if idx == -1 {
+			sm.inputChan <- StdinManagerMsg{
+				attach: NOCHANGE,
+				data:   string(p),
+			}
+		} else {
+			sm.inputChan <- StdinManagerMsg{
+				attach: NOCHANGE,
+				data:   string(p[:idx]),
+			}
+			sm.Detach()
 		}
 	}
+	return len(p), nil
 }
 
-func (cw *cmdWrapper) Kill() {
-	cw.killInited = true
-	if !cw.running || cw.cmd == nil || cw.cmd.Process == nil {
-		log.Println("Kill requested, but no process is running.")
-		return
+func (sm *StdinManager) Detach() {
+	term.Restore(stdinFd(), sm.termState)
+	log.Println("terminal detached. enter \"term\" to attach")
+	sm.attached = false
+	sm.inputChan <- StdinManagerMsg{attach: DETACHING}
+}
+
+func CmdWrapper(args []string, closeChan chan bool, stdinMgr *StdinManager) (func() error, error) {
+	cmd := exec.Command(args[0], args[1:]...)
+	ptx, err := pty.Start(cmd)
+	log.Printf("Executing %s (PID %d)", cmd.String(), cmd.Process.Pid)
+	if err != nil {
+		return nil, err
 	}
+	startTime := time.Now()
+	outRb := NewRingBuf(2048)
 
-	log.Println("Attempting graceful shutdown with SIGINT...")
+	// attach/detach stdin
+	quitChan := make(chan struct{})
+	termState, err := term.GetState(stdinFd())
+	if err != nil {
+		return nil, err
+	}
+	// pipe tty to the ringbuffer
+	go io.Copy(outRb, ptx)
 
-	// Send the interrupt signal (like Ctrl+C)
-	if err := cw.cmd.Process.Signal(os.Interrupt); err != nil {
-		log.Printf("Failed to send SIGINT: %v. Forcing kill.", err)
-		// If sending SIGINT fails, go straight to SIGKILL
-		if killErr := cw.cmd.Process.Kill(); killErr != nil {
-			log.Printf("Failed to send SIGKILL: %v", killErr)
+	// attach/detach stdin/stdout
+	go func() {
+		for {
+			select {
+			case <-quitChan:
+				return
+			case msg := <-stdinMgr.inputChan:
+				switch msg.attach {
+				case ATTACHING:
+					outRb.DumpAttach(os.Stdout)
+				case NOCHANGE:
+					ptx.Write([]byte(msg.data))
+				case DETACHING:
+					outRb.Detach()
+				}
+			}
 		}
-		return
-	}
+	}()
+	log.Println("enter \"term\" to attach")
+
+	// cleanup goroutine
+	closeRequested := false
+	go func() {
+		cmd.Wait()
+		term.Restore(stdinFd(), termState)
+		log.Printf("Process exited. Status code %d uptime: %v", cmd.ProcessState.ExitCode(), time.Since(startTime))
+		stdinMgr.Detach()
+		outRb.Detach()
+		close(quitChan)
+		ptx.Close()
+		closeChan <- closeRequested
+	}()
+
+	return func() error {
+		closeRequested = true
+		err := cmd.Process.Signal(os.Interrupt)
+		log.Println("sent sigint")
+		return err
+	}, nil
+}
+
+func stdinFd() int {
+	return int(os.Stdin.Fd())
 }
