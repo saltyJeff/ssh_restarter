@@ -80,6 +80,7 @@ func Restarter(cmdline []string, loginChan chan LoginChange, idleTimoutSec uint)
 	log.Println("first execution, program termination scheduled")
 	timeoutDuration := time.Duration(idleTimoutSec) * time.Second
 	timer := time.NewTimer(timeoutDuration)
+	attached := false
 
 	for {
 		select {
@@ -91,7 +92,7 @@ func Restarter(cmdline []string, loginChan chan LoginChange, idleTimoutSec uint)
 				delete(sessions, login.loginId)
 			}
 			log.Println("number of connections:", len(sessions))
-			if len(sessions) == 0 {
+			if len(sessions) == 0 && !attached {
 				log.Println("no users, scheduling program termination")
 				timer.Reset(timeoutDuration)
 			} else {
@@ -106,6 +107,7 @@ func Restarter(cmdline []string, loginChan chan LoginChange, idleTimoutSec uint)
 				cmdKiller()
 			}
 		case attach := <-stdinMgr.attachChan:
+			attached = attach
 			if attach {
 				timer.Stop()
 				if cmdKiller == nil {
