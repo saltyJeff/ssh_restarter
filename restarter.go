@@ -82,6 +82,21 @@ func Restarter(cmdline []string, loginChan chan LoginChange, idleTimoutSec uint)
 	timer := time.NewTimer(timeoutDuration)
 	attached := false
 
+	updateState := func() {
+		log.Println("terminal attached?", attached, "# sessions", len(sessions))
+		shouldStopTimer := attached || len(sessions) != 0
+		if shouldStopTimer {
+			timer.Stop()
+			if cmdKiller == nil {
+				cmdKiller, _ = CmdWrapper(cmdline, closeChan, stdinMgr)
+			}
+		} else {
+			log.Println("no users, scheduling program termination")
+			timer.Reset(timeoutDuration)
+		}
+	}
+	_ = updateState
+
 	for {
 		select {
 		case login := <-loginChan:
@@ -92,32 +107,14 @@ func Restarter(cmdline []string, loginChan chan LoginChange, idleTimoutSec uint)
 				delete(sessions, login.loginId)
 			}
 			log.Println("number of connections:", len(sessions))
-			if len(sessions) == 0 && !attached {
-				log.Println("no users, scheduling program termination")
-				timer.Reset(timeoutDuration)
-			} else {
-				timer.Stop()
-				if cmdKiller == nil {
-					log.Println("new user, starting program")
-					cmdKiller, _ = CmdWrapper(cmdline, closeChan, stdinMgr)
-				}
-			}
+			updateState()
 		case <-timer.C:
 			if cmdKiller != nil {
 				cmdKiller()
 			}
 		case attach := <-stdinMgr.attachChan:
 			attached = attach
-			if attach {
-				timer.Stop()
-				if cmdKiller == nil {
-					log.Println("cli attach require starting program")
-					cmdKiller, _ = CmdWrapper(cmdline, closeChan, stdinMgr)
-				}
-			} else if len(sessions) == 0 {
-				log.Println("detached and no users, scheduling program termination")
-				timer.Reset(timeoutDuration)
-			}
+			updateState()
 		case closeRequested := <-closeChan:
 			howClosed := "unexpectedly"
 			if closeRequested {
@@ -125,11 +122,7 @@ func Restarter(cmdline []string, loginChan chan LoginChange, idleTimoutSec uint)
 			}
 			log.Println("command terminated", howClosed)
 			cmdKiller = nil
-			if len(sessions) != 0 {
-				log.Println("command terminated even though there are sessions, restarting")
-				cmdKiller, _ = CmdWrapper(cmdline, closeChan, stdinMgr)
-				timer.Stop()
-			}
+			updateState()
 		}
 	}
 }
