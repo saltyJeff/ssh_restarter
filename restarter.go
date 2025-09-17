@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"time"
 
 	"github.com/gliderlabs/ssh"
 	gossh "golang.org/x/crypto/ssh"
@@ -71,29 +72,62 @@ func MakeRestarterTCPHandler(loginChan chan LoginChange) ssh.ChannelHandler {
 	}
 }
 
-func Restarter(cmdline []string, loginChan chan LoginChange) {
+func Restarter(cmdline []string, loginChan chan LoginChange, idleTimoutSec uint) {
 	closeChan := make(chan bool)
 	sessions := map[string]bool{}
 	stdinMgr, _ := StartStdinManager()
-	for {
-		cmd, _ := CmdWrapper(cmdline, closeChan, stdinMgr)
+	cmdKiller, _ := CmdWrapper(cmdline, closeChan, stdinMgr)
+	log.Println("first execution, program termination scheduled")
+	timeoutDuration := time.Duration(idleTimoutSec) * time.Second
+	timer := time.NewTimer(timeoutDuration)
 
+	for {
 		select {
 		case login := <-loginChan:
 			if login.newLogin {
 				sessions[login.loginId] = true
-				if cmd == nil {
-					cmd, _ = CmdWrapper(cmdline, closeChan, stdinMgr)
-				}
+
 			} else {
 				delete(sessions, login.loginId)
 			}
 			log.Println("number of connections:", len(sessions))
-		case closeRequested := <-closeChan:
-			if !closeRequested {
-				log.Println("command closed extraneously!")
+			if len(sessions) == 0 {
+				log.Println("no users, scheduling program termination")
+				timer.Reset(timeoutDuration)
+			} else {
+				timer.Stop()
+				if cmdKiller == nil {
+					log.Println("new user, starting program")
+					cmdKiller, _ = CmdWrapper(cmdline, closeChan, stdinMgr)
+				}
 			}
-			cmd = nil
+		case <-timer.C:
+			if cmdKiller != nil {
+				cmdKiller()
+			}
+		case attach := <-stdinMgr.attachChan:
+			if attach {
+				timer.Stop()
+				if cmdKiller == nil {
+					log.Println("cli attach require starting program")
+					cmdKiller, _ = CmdWrapper(cmdline, closeChan, stdinMgr)
+				}
+			} else if len(sessions) == 0 {
+				log.Println("detached and no users, scheduling program termination")
+				timer.Reset(timeoutDuration)
+			}
+		case closeRequested := <-closeChan:
+			howClosed := "unexpectedly"
+			if closeRequested {
+				howClosed = "expectedly"
+			}
+			log.Println("command terminated", howClosed)
+			cmdKiller = nil
+			if len(sessions) != 0 {
+				log.Println("command terminated even though there are sessions, restarting")
+				cmdKiller, _ = CmdWrapper(cmdline, closeChan, stdinMgr)
+				timer.Stop()
+			}
 		}
 	}
 }

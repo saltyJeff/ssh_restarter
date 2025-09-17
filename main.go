@@ -5,15 +5,33 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 
 	"github.com/gliderlabs/ssh"
+	"golang.org/x/crypto/bcrypt"
 )
+
+var PWD_ENVVAR = "SSH_RESTARTER_PWD"
 
 func main() {
 	sshPort := flag.Uint("ssh_port", 22, "port for the ssh server to listen on")
 	fwdPort := flag.Uint("fwd_port", 25565, "destination port on the server for all forwards")
-	sshHostKeyPath := flag.String("ssh_host_key_path", "/etc/ssh/ssh_host_rsa", "path to the ssh host key")
+	sshHostKeyPath := flag.String("hostkey", "/etc/ssh/ssh_host_rsa", "path to the ssh host key")
+	sshPwdPtr := flag.String("pwd", "", fmt.Sprintf("the bcrypt of the server password. if not provided, will read from %s envvar", PWD_ENVVAR))
+	idleTimoutSec := flag.Uint("timeout", 600, "seconds with 0 connections before terminating process")
 	flag.Parse()
+
+	if len(flag.Args()) == 0 {
+		log.Fatal("you must provide a command to run")
+	}
+	sshPwd := *sshPwdPtr
+	if sshPwd == "" {
+		sshPwd = os.Getenv(PWD_ENVVAR)
+		if sshPwd == "" {
+			log.Fatal("SSH password provided neither as CLI arg or env var")
+		}
+	}
+	sshPwdBytes := []byte(sshPwd)
 
 	loginChangeChan := make(chan LoginChange)
 
@@ -30,7 +48,7 @@ func main() {
 		Handler: ssh.Handler(func(s ssh.Session) {
 			io.WriteString(s, "Port forwarding only!\r\n")
 			io.WriteString(s, fmt.Sprintf(
-				"Try this command: ssh -L %d:localhost%d -N <server address> -p %d\r\n",
+				"Try this command: ssh -L %d:localhost:%d -N <server address> -p %d\r\n",
 				*fwdPort, *fwdPort, *sshPort))
 			s.Exit(1)
 		}),
@@ -41,10 +59,13 @@ func main() {
 	}
 	ssh.HostKeyFile(*sshHostKeyPath)(&server)
 	ssh.PasswordAuth(func(ctx ssh.Context, pass string) bool {
-		log.Println("Password", pass)
-		return true
+		err := bcrypt.CompareHashAndPassword(sshPwdBytes, []byte(pass))
+		if err != nil {
+			log.Println("could not bcrypt", err)
+		}
+		return err == nil
 	})(&server)
 	log.Println("Starting ssh server on port", *sshPort, "accepting forwards to", *fwdPort)
-	go Restarter(flag.Args(), loginChangeChan)
+	go Restarter(flag.Args(), loginChangeChan, *idleTimoutSec)
 	log.Fatal(server.ListenAndServe(), nil)
 }

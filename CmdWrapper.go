@@ -27,14 +27,19 @@ type StdinManager struct {
 	termState *term.State
 	attached  bool
 	rb        *RingBuf
+	// this channel used by the cmd wrapper
 	inputChan chan StdinManagerMsg
+	// this channel used only to signal that an attach is requested
+	// use for when cmd wrapper not executing
+	attachChan chan bool
 }
 
 func StartStdinManager() (*StdinManager, error) {
 	stdinMgr := &StdinManager{
-		inputChan: make(chan StdinManagerMsg),
-		attached:  false,
-		rb:        NewRingBuf(8),
+		inputChan:  make(chan StdinManagerMsg),
+		attachChan: make(chan bool),
+		attached:   false,
+		rb:         NewRingBuf(16),
 	}
 	ts, err := term.GetState(stdinFd())
 	stdinMgr.termState = ts
@@ -59,20 +64,20 @@ func (sm *StdinManager) Write(p []byte) (n int, err error) {
 			return n, nil
 		}
 		log.Println("terminal attached. CTRL+A to detach")
+		sm.attached = true
+		endOfSigil := loc[1]
+		dataAfterSigil := bufferBytes[endOfSigil:]
 
+		sm.attachChan <- true // this has to be before the terminal modeset and inputChan
+		sm.inputChan <- StdinManagerMsg{
+			attach: ATTACHING,
+			data:   string(dataAfterSigil),
+		}
 		if ts, err := term.MakeRaw(stdinFd()); err == nil {
 			sm.termState = ts
 		} else {
 			log.Printf("failed to set terminal to raw mode: %v", err)
 			return n, err
-		}
-		sm.attached = true
-		endOfSigil := loc[1]
-		dataAfterSigil := bufferBytes[endOfSigil:]
-
-		sm.inputChan <- StdinManagerMsg{
-			attach: ATTACHING,
-			data:   string(dataAfterSigil),
 		}
 		sm.rb.Reset()
 	} else {
@@ -96,9 +101,9 @@ func (sm *StdinManager) Write(p []byte) (n int, err error) {
 
 func (sm *StdinManager) Detach() {
 	term.Restore(stdinFd(), sm.termState)
-	log.Println("terminal detached. enter \"term\" to attach")
 	sm.attached = false
 	sm.inputChan <- StdinManagerMsg{attach: DETACHING}
+	sm.attachChan <- false
 }
 
 func CmdWrapper(args []string, closeChan chan bool, stdinMgr *StdinManager) (func() error, error) {
@@ -109,7 +114,7 @@ func CmdWrapper(args []string, closeChan chan bool, stdinMgr *StdinManager) (fun
 		return nil, err
 	}
 	startTime := time.Now()
-	outRb := NewRingBuf(2048)
+	outRb := NewRingBuf(4096)
 
 	// attach/detach stdin
 	quitChan := make(chan struct{})
@@ -157,6 +162,12 @@ func CmdWrapper(args []string, closeChan chan bool, stdinMgr *StdinManager) (fun
 		closeRequested = true
 		err := cmd.Process.Signal(os.Interrupt)
 		log.Println("sent sigint")
+		time.AfterFunc(5*time.Second, func() {
+			if cmd.ProcessState == nil {
+				cmd.Process.Kill()
+				log.Println("no response to sigint, sent sigkill")
+			}
+		})
 		return err
 	}, nil
 }
