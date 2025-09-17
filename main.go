@@ -19,6 +19,7 @@ func main() {
 	sshHostKeyPath := flag.String("hostkey", "/etc/ssh/ssh_host_rsa", "path to the ssh host key")
 	sshPwdPtr := flag.String("pwd", "", fmt.Sprintf("the bcrypt of the server password. if not provided, will read from %s envvar", PWD_ENVVAR))
 	idleTimoutSec := flag.Uint("timeout", 600, "seconds with 0 connections before terminating process")
+	maxRetries := flag.Uint("retries", 20, "max number of 5s retries for a client to connect to the destination port")
 	flag.Parse()
 
 	if len(flag.Args()) == 0 {
@@ -53,7 +54,7 @@ func main() {
 			s.Exit(1)
 		}),
 		ChannelHandlers: map[string]ssh.ChannelHandler{
-			"direct-tcpip": MakeRestarterTCPHandler(loginChangeChan),
+			"direct-tcpip": MakeRestarterTCPHandler(loginChangeChan, *maxRetries),
 			"session":      ssh.DefaultSessionHandler,
 		},
 	}

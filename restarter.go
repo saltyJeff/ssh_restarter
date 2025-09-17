@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -23,7 +24,7 @@ type localForwardChannelData struct {
 	OriginPort uint32
 }
 
-func MakeRestarterTCPHandler(loginChan chan LoginChange) ssh.ChannelHandler {
+func MakeRestarterTCPHandler(loginChan chan LoginChange, maxRetries uint) ssh.ChannelHandler {
 	return func(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.NewChannel, ctx ssh.Context) {
 		d := localForwardChannelData{}
 		if err := gossh.Unmarshal(newChan.ExtraData(), &d); err != nil {
@@ -42,9 +43,25 @@ func MakeRestarterTCPHandler(loginChan chan LoginChange) ssh.ChannelHandler {
 		loginChan <- LoginChange{newLogin: true, loginId: loginId}
 
 		var dialer net.Dialer
-		dconn, err := dialer.DialContext(ctx, "tcp", dest)
+		var err error
+		var dconn net.Conn
+		const retryDelay = 5 * time.Second
+
+		for i := uint(0); i < maxRetries; i++ {
+			// Attempt to dial the connection
+			dconn, err = dialer.DialContext(ctx, "tcp", dest)
+			if err == nil {
+				// If the error is nil, the connection succeeded. Break the loop.
+				break
+			}
+			log.Printf("Connection attempt %d/%d failed: %v. Retrying in %v...\n", i+1, maxRetries, err, retryDelay)
+			if i == maxRetries-1 {
+				break
+			}
+			time.Sleep(retryDelay)
+		}
 		if err != nil {
-			newChan.Reject(gossh.ConnectionFailed, err.Error())
+			newChan.Reject(gossh.ConnectionFailed, fmt.Sprintf("failed to connect after %d attempts: %v", maxRetries, err))
 			loginChan <- LoginChange{newLogin: false, loginId: loginId}
 			return
 		}
