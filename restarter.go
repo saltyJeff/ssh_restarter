@@ -95,7 +95,6 @@ func Restarter(cmdline []string, loginChan chan LoginChange, idleTimoutSec uint)
 			timer.Reset(timeoutDuration)
 		}
 	}
-	_ = updateState
 
 	for {
 		select {
