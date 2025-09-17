@@ -38,7 +38,7 @@ func main() {
 	server := ssh.Server{
 		Addr: fmt.Sprintf(":%d", *sshPort),
 		LocalPortForwardingCallback: ssh.LocalPortForwardingCallback(func(ctx ssh.Context, dhost string, dport uint32) bool {
-			ok := dhost == "localhost" && dport == uint32(*fwdPort)
+			ok := (dhost == "localhost" || dhost == "127.0.0.1") && dport == uint32(*fwdPort)
 			if ok {
 				return true
 			}

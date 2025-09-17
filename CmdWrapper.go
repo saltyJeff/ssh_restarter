@@ -109,10 +109,10 @@ func (sm *StdinManager) Detach() {
 func CmdWrapper(args []string, closeChan chan bool, stdinMgr *StdinManager) (func() error, error) {
 	cmd := exec.Command(args[0], args[1:]...)
 	ptx, err := pty.Start(cmd)
-	log.Printf("Executing %s (PID %d)", cmd.String(), cmd.Process.Pid)
 	if err != nil {
-		return nil, err
+		log.Fatal("couldn't run command ", err)
 	}
+	log.Printf("Executing %s (PID %d)", cmd.String(), cmd.Process.Pid)
 	startTime := time.Now()
 	outRb := NewRingBuf(4096)
 
